@@ -1,4 +1,5 @@
 ## 架构图
+
 **Web 前端 ↔ API 网关/应用服务 ↔ 会话与编排器 ↔ 主 Agent + 子 Agent ↔ 数据与可观测**。
 
 ```mermaid
@@ -19,21 +20,29 @@ graph TB
   subgraph SessionOrch["会话与编排 Session Orchestrator"]
     SM["Session 单写入口与并发控制"]
     ST["Query 状态机 FSM"]
-    CTX["上下文装配 原始对话与压缩视图"]
+    CTX["上下文装配"]
+    ERR["执行错误判断"]
+    RETRY["可重试 重新执行当前状态"]
+    FAIL["不可重试或重试无效 直接报错"]
   end
 
   subgraph Agents["智能体层"]
-    MA["主Agent 多轮召回 规则与工具 LLM"]
-    SA_Persist["子 Agent: 结构化落库 抽取 assessment 等"]
-    SA_Exp["子 Agent: 经验提取与入 tmp 池"]
+    MA["主 Agent"]
+    AR["推理决策"]
+    RTK["召回工具"]
+    OTK["其他工具"]
+    TR["工具结果汇总"]
+    AO["最终总结输出"]
+    SA_Persist["结构化落库子 Agent"]
+    SA_Exp["经验提取子 Agent"]
   end
 
   subgraph Data["数据与知识"]
-    DB[(关系库PostgreSQL业务表)]
-    KB["知识库 向量+元数据"]
-    ExpTmp["经验 tmp 池"]
-    ExpPer["经验持久化池"]
-    SessStore["Session 全量与压缩快照 本地/对象存储"]
+    DB[(关系库)]
+    KB["知识库"]
+    ExpPool["经验池二级管理"]
+    SessStore["Session 存储"]
+    SessRaw["一级 原始全量记录"]
   end
 
   subgraph Obs["可观测性"]
@@ -50,72 +59,96 @@ graph TB
   API_Submit --> SM
   SM --> ST
   SM --> CTX
+  ST --> ERR
+  ERR -->|可重试| RETRY
+  RETRY --> ST
+  ERR -->|不可重试或重试无效| FAIL
   CTX --> MA
-  MA --> KB
-  MA --> DB
-  MA --> ExpTmp
-  MA --> ExpPer
+  MA --> AR
+  AR --> RTK
+  AR --> OTK
+  RTK --> TR
+  OTK --> TR
+  TR --> AR
+  AR --> AO
+  RTK --> KB
+  RTK --> ExpPool
+  OTK --> DB
+  MA -.->|执行错误| ERR
+  SM --> SessStore
+  CTX --> SessStore
+  TR --> SessStore
+  SessStore --> SessRaw
 
-  MA -->|一轮结束| SA_Persist
-  MA -->|一轮结束| SA_Exp
+  AO -->|一轮结束| SA_Persist
+  AO -->|一轮结束| SA_Exp
   SA_Persist --> DB
-  SA_Exp --> ExpTmp
+  SA_Exp --> ExpPool
   ST --> LogAgg
+  FAIL --> LogAgg
   API_Submit --> LogAgg
 ```
 
 
-## 请求与数据流（端到端）
-
-本节按 **控制面**（请求/编排/状态）与 **数据面**（各类数据最终落在哪种介质）描述一条评估请求的端到端路径。介质分工与 §3 中 **DB / KB / Exp* / SessStore** 一致：**关系型业务 → 数据库 `D`**，**经验条目 → JSON 文件池 `E`**（tmp + 持久分区），**知识 chunk → 向量库 `K`**，**完整对话与 tool 轨迹 → 本地文件 `FS`**（实现上可对应 §9 全量/快照/manifest 三层，此处序列图统称 `FS`）。
-
+## 数据流向时序图
 
 ```mermaid
 sequenceDiagram
-  participant UI as Web 前端
-  participant API as BFF API
-  participant SM as Session 单写入口
-  participant FSM as Query 状态机
-  participant CTX as 上下文装配
-  participant MA as 主 Agent
-  participant KB as 知识库 K
-  participant DB as 数据库 D
-  participant FS as 会话文件 FS
-  participant TMP as 经验 tmp 池 E/tmp
-  participant PER as 经验持久池 E/per
-  participant SP as 结构化落库子 Agent
-  participant SE as 经验提取子 Agent
-  participant OBS as 可观测性
+    participant UI as Web
+    participant API as BFF
+    participant SM as Session
+    participant CTX as Context
+    participant MA as MainAgent
+    participant RS as Reasoner
+    participant RT as RecallTool
+    participant OT as OtherTool
+    participant KB as KnowledgeBase
+    participant DB as Database
+    participant FS as SessionStore
+    participant EXP as ExperiencePool
+    participant SP as PersistAgent
+    participant SE as ExperienceAgent
+    participant OBS as Observability
 
-  UI->>API: 提交评估请求
-  API->>SM: 创建或恢复 Session
-  SM->>FSM: 进入 running 状态
-  SM->>FS: 写入原始输入与请求元数据
-  SM->>CTX: 装配上下文
-  CTX->>FS: 读取历史对话与工具轨迹
-  CTX->>DB: 读取业务对象与历史结果
-  CTX->>TMP: 读取临时经验候选
-  CTX->>PER: 读取持久经验
-  CTX-->>MA: 返回压缩后的运行上下文
+    UI->>API: submit assessment
+    API->>SM: create or resume session
+    SM->>FS: append user input
+    SM->>CTX: build context
+    CTX->>FS: read session history
+    CTX->>EXP: read experience pool
+    CTX-->>MA: return context
 
-  MA->>KB: 检索相关知识 chunk
-  KB-->>MA: 返回知识片段与元数据
-  MA->>DB: 查询或写入业务过程数据
-  MA->>FS: 追加模型消息与工具调用轨迹
-  MA-->>API: 流式返回阶段性结果
-  API-->>UI: 推送进度与中间输出
+    MA->>RS: start reasoning
+    loop agent reasoning loop
+        RS->>RT: call recall tools
+        RT->>KB: retrieve knowledge
+        KB-->>RT: return chunks
+        RT->>EXP: retrieve experience
+        EXP-->>RT: return experience items
+        RT-->>RS: return recall results
+        RS->>OT: call other tools
+        OT->>DB: read or write business data
+        DB-->>OT: return db result
+        OT->>FS: append tool trace
+        FS-->>OT: return file result
+        OT-->>RS: return tool results
+        RS-->>MA: update reasoning state
+        MA->>RS: continue or finish
+    end
 
-  MA->>SP: 一轮结束后发送结构化抽取任务
-  SP->>DB: 写入 assessment、评分、结论等结构化结果
-  SP-->>SM: 返回落库状态
+    RS-->>MA: final structured answer
+    MA->>FS: append agent trace
+    MA-->>API: stream partial result
+    API-->>UI: push stream
 
-  MA->>SE: 一轮结束后发送经验提取任务
-  SE->>TMP: 写入候选经验条目
-  SE->>PER: 晋升高置信经验
-  SE-->>SM: 返回经验处理状态
+    MA->>SP: persist structured result
+    SP->>DB: write assessment result
+    SP-->>SM: persist done
 
-  SM->>FSM: 根据主流程与子任务结果进入 completed 或 failed
-  SM->>FS: 写入 Session 快照与最终 manifest
-  SM->>OBS: 记录状态迁移、耗时、错误与审计事件
-  API-->>UI: 返回最终评估结果
+    MA->>SE: extract experience
+    SE->>EXP: write candidate or promote item
+    SE-->>SM: experience done
+
+    SM->>OBS: record events
+    API-->>UI: return final result
 ```
